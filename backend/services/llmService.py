@@ -1,260 +1,295 @@
-from openai import OpenAI
 import os
-from dotenv import load_dotenv
+import json
 import logging
+from dotenv import load_dotenv
+from openai import OpenAI
+import anthropic
+import google.generativeai as genai
+from typing import Dict, Any
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+# Agents 
+from agents.geoExplorerAgent import GeoExplorerAgent
+from agents.climateImpactAgent import ClimateImpactAgent
 
-def generate_llm_response(message, model, coordinates):
+# Instantiate the agents
+geo_explorer = GeoExplorerAgent()
+climate_impact = ClimateImpactAgent()
+
+# Define tools for dynamic invocation
+TOOL_CONFIG = {
+    "geo_explorer": {
+        "description": "Provides geographical information about a location.",
+        "function": geo_explorer.get_location_info,
+        "parameters": ["location", "coordinates"]
+    },
+    "climate_impact": {
+        "description": "Provides climate and weather information for a location.",
+        "function": climate_impact.get_weather_info,
+        "parameters": ["location", "coordinates"]
+    }
+}
+
+
+def get_llm_client(model: str) -> tuple:
+    """Initialize and validate LLM clients with proper error handling."""
     try:
-        logger.debug(f"Received message: {message}, model: {model}, coordinates: {coordinates}")
-        if not os.getenv('OPENAI_API_KEY'):
-            raise ValueError("OpenAI API key is not set in environment variables")
+        if model == "gpt-4":
+            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+            return client, "openai"
+        elif model == "claude":
+            return anthropic.Anthropic(api_key=os.getenv('CLAUDE_API_KEY')), "claude"
+        elif model == "gemini":
+            genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+            return genai.GenerativeModel('gemini-pro'), "gemini"
+        elif model == "deepseek":
+            client = OpenAI(
+                api_key=os.getenv('DEEPSEEK_API_KEY'),
+                base_url="https://api.deepseek.com/v1"
+            )
+            return client, "deepseek"
+        raise ValueError(f"Unsupported model: {model}")
+    except KeyError as e:
+        logger.error(f"Missing API key: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Client initialization failed: {str(e)}")
+        raise
 
-        coords = coordinates.get('coordinates', 'unknown') if coordinates else 'unknown'
-        zoom = coordinates.get('zoom', 'unknown') if coordinates else 'unknown'
-        prompt = f"""You are a geospatial AI assistant. The user is at coordinates {coords} with zoom level {zoom}. They asked: "{message}". Provide a helpful response in JSON format with 'text' and 'suggestions' fields. Suggestions should be actionable (e.g., URLs or commands) related to the query. Example:
-        {{
-          "text": "Here are some tourist attractions near you.",
-          "suggestions": [
-            {{"label": "Visit Eiffel Tower", "action": "https://www.toureiffel.paris/en"}},
-            {{"label": "Explore Louvre", "action": "https://www.louvre.fr/en"}}
-          ]
-        }}"""
+def _format_llm_prompt(message: str, coordinates: Dict[str, Any], tools: dict) -> str:
+    """Construct a structured prompt with strict JSON formatting requirements."""
+    coord_text = f"at coordinates {coordinates['coordinates']} (zoom {coordinates['zoom']})" if coordinates else ""
+    tool_descriptions = "\n".join(
+        f"- {name}: {info['description']} (params: {info['parameters']})"
+        for name, info in tools.items()
+    )
+    
+    return f"""You are a geospatial AI assistant. The user is {coord_text} and asks: "{message}"
 
-        response = client.chat.completions.create(
-            model=model if model in ['gpt-4', 'gpt-3.5-turbo'] else 'gpt-3.5-turbo',
-            messages=[
-                {"role": "system", "content": "You are a helpful geospatial AI assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=200,
-            temperature=0.7
-        )
+                Available Tools:
+                {tool_descriptions}
 
-        json_response = eval(response.choices[0].message.content)  # Parse JSON (unsafe, replace with json.loads later)
-        logger.debug(f"OpenAI response: {json_response}")
+                Response Requirements:
+                1. If using a tool, output ONLY valid JSON with "tool" and "parameters"
+                2. For direct answers, use JSON with "text" (natural language) and "suggestions"
+                3. Maintain conversation flow and context
+
+                Examples:
+                Tool Call:
+                {{
+                "tool": "geo_explorer",
+                "parameters": {{
+                    "location": "Paris, France"
+                }}
+                }}
+
+                Direct Response:
+                {{
+                "text": "Here's information about your location...",
+                "suggestions": [
+                    {{"label": "View Map", "action": "map:paris"}}
+                ]
+                }}"""
+
+def _handle_tool_call(tool_name: str, parameters: dict) -> Dict[str, Any]:
+    """Execute tool calls with proper validation and error handling."""
+    try:
+        if tool_name not in TOOL_CONFIG:
+            return {"error": "Unknown tool", "details": tool_name}
         
+        # Validate parameters
+        required_params = TOOL_CONFIG[tool_name]["parameters"]
+        missing = [p for p in required_params if p not in parameters]
+        if missing:
+            return {"error": "Missing parameters", "missing": missing}
+        
+        # Execute tool
+        result = TOOL_CONFIG[tool_name]["function"](**parameters)
+        
+        # Convert tool-specific response to standard format
         return {
-            'text': json_response['text'],
-            'suggestions': json_response.get('suggestions', []),
-            'analysis': {'coordinates': coords, 'visualization': 'heatmap' if 'density' in message.lower() else None}
+            "tool_response": result,
+            "metadata": {
+                "tool": tool_name,
+                "success": "error" not in result
+            }
         }
     except Exception as e:
-        logger.error(f"LLM request failed: {str(e)}")
-        raise Exception(f"LLM request failed: {str(e)}")
+        logger.error(f"Tool execution failed: {str(e)}")
+        return {"error": "Tool execution failed", "details": str(e)}
+
+def _generate_conversational_response(client, provider: str, model: str, user_query: str, tool_data: dict) -> Dict[str, Any]:
+    """Convert raw tool data into a natural language response."""
+    try:
+        prompt = f"""Convert this technical data into a friendly, conversational response:
+        
+        User Query: {user_query}
+        Tool Data: {json.dumps(tool_data, indent=2)}
+        
+        Guidelines:
+        - Use simple, non-technical language
+        - Highlight key information first
+        - Include suggestions from the tool data
+        - Acknowledge any data limitations
+        - Keep responses under 3 paragraphs
+        """
+        
+        if provider=="openai":
+            response = client.chat.completions.create(
+                model='gpt-4o-mini',
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that explains information clearly."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.6
+            )
+            content = response.choices[0].message.content
+        elif provider=="deepseek":
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that explains information clearly."},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=False
+            )
+            content = response.choices[0].message.content
+        elif provider == "claude":
+            response = client.messages.create(
+                model='claude-3-opus-latest',
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            content = response.content[0].text
+        elif provider == "gemini-1.5-flash":
+            response = client.generate_content(prompt)
+            content = response.text
+        
+        return {
+            "text": content,
+            "suggestions": tool_data.get("suggestions", []),
+            "analysis": tool_data.get("analysis", {})
+        }
+    except Exception as e:
+        logger.error(f"Response generation failed: {str(e)}")
+        return {"text": "I encountered an error processing that request. Please try again.", "error": str(e)}
+
+def generate_llm_response(message: str, model: str, coordinates: Dict[str, Any]) -> Dict[str, Any]:
+    """End-to-end processing with improved error handling and conversational flow."""
+    try:
+        client, provider = get_llm_client(model)
+        prompt = _format_llm_prompt(message, coordinates, TOOL_CONFIG)
+        
+        # Get initial LLM response
+        if provider=="openai":
+            response = client.chat.completions.create(
+                model='gpt-3.5-turbo',
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that explains information clearly."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.6
+            )
+            llm_output = response.choices[0].message.content
+        elif provider=="deepseek":
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that explains information clearly."},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=False
+            )
+            llm_output = response.choices[0].message.content
+        elif provider == "claude":
+            response = client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            llm_output = response.content[0].text
+        elif provider == "gemini":
+            response = client.generate_content(prompt)
+            llm_output = response.text
+        
+        # Parse and validate response
+        try:
+            llm_response = json.loads(llm_output)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse LLM response as JSON, using fallback")
+            return {
+                "text": f"I'm having trouble processing that request. Here's what I can share: {llm_output}",
+                "error": "Invalid JSON response"
+            }
+
+        # Process tool calls
+        if "tool" in llm_response:
+            tool_result = _handle_tool_call(llm_response["tool"], llm_response.get("parameters", {}))
+            
+            if "error" in tool_result:
+                return _generate_conversational_response(
+                    client, provider, model, message,
+                    {"error": tool_result["error"], "original_query": message}
+                )
+            
+            return _generate_conversational_response(
+                client, provider, model, message,
+                tool_result.get("tool_response", {})
+            )
+
+        # Direct response cleanup
+        return {
+            "text": llm_response.get("text", "I couldn't process that request."),
+            "suggestions": llm_response.get("suggestions", []),
+            "analysis": coordinates if coordinates else {}
+        }
+
+    except Exception as e:
+        logger.error(f"End-to-end processing failed: {str(e)}")
+        return {
+            "text": "I'm having trouble with that request. Please try rephrasing or ask about something else.",
+            "error": str(e)
+        }
+
+
+## TODO:
+"""
+
+Fix the initialization Error for the Gemini, Claude
+:00] "POST /api/chat HTTP/1.1" 500 -
+INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:16:09] "OPTIONS /api/chat HTTP/1.1" 200 -
+INFO:routes.chatRoutes:Chat request - Session: d10b5e85-2ad5-49bb-86ca-af9c0031c1b1, Model: gemmni
+ERROR:services.llmService:Client initialization failed: Unsupported model: gemmni
+ERROR:services.llmService:End-to-end processing failed: Unsupported model: gemmni
+ERROR:routes.chatRoutes:LLM Error: Unsupported model: gemmni
+INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:16:09] "POST /api/chat HTTP/1.1" 500 -
+INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:16:19] "OPTIONS /api/chat HTTP/1.1" 200 -
+INFO:routes.chatRoutes:Chat request - Session: d10b5e85-2ad5-49bb-86ca-af9c0031c1b1, Model: claude-2
+ERROR:services.llmService:Client initialization failed: Unsupported model: claude-2
+ERROR:services.llmService:End-to-end processing failed: Unsupported model: claude-2
+ERROR:routes.chatRoutes:LLM Error: Unsupported model: claude-2
 
 
 
-# from openai import OpenAI
-# import os
-# from dotenv import load_dotenv
-# import logging
-# from agents.geoExplorerAgent import GeoExplorerAgent
-# from agents.visualGuideAgent import VisualGuideAgent
-# from agents.climateImpactAgent import ClimateImpactAgent
-# from agents.travelPlannerAgent import TravelPlannerAgent
-# from agents.disasterRiskAgent import DisasterRiskAgent
-# from agents.deepSeaAgent import DeepSeaAgent
-# from agents.historicalTimeMachineAgent import HistoricalTimeMachineAgent
-# from agents.ecoFootprintAgent import EcoFootprintAgent
-# from agents.cultureLanguageAgent import CultureLanguageAgent
-# from agents.trendAnalyzerAgent import TrendAnalyzerAgent
+Check the Json Format error for G-P-T and DeepSeek
+INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:15:40] "OPTIONS /api/chat HTTP/1.1" 200 -
+INFO:routes.chatRoutes:Chat request - Session: d10b5e85-2ad5-49bb-86ca-af9c0031c1b1, Model: deepseek
+INFO:httpx:HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+WARNING:services.llmService:Failed to parse LLM response as JSON, using fallback
+ERROR:routes.chatRoutes:LLM Error: Invalid JSON response
+INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:15:49] "POST /api/chat HTTP/1.1" 500 -
 
-# logging.basicConfig(level=logging.DEBUG)
-# logger = logging.getLogger(__name__)
+INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:15:58] "OPTIONS /api/chat HTTP/1.1" 200 -
+INFO:routes.chatRoutes:Chat request - Session: d10b5e85-2ad5-49bb-86ca-af9c0031c1b1, Model: gpt-4
+INFO:httpx:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:httpx:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 400 Bad Request"
+ERROR:services.llmService:Response generation failed: Error code: 400 - {'error': {'message': "'messages' must contain the word 'json' in some form, to use 'response_format' of type 'json_object'.", 'type': 'invalid_request_error', 'param': 'messages', 'code': None}}
+ERROR:routes.chatRoutes:LLM Error: Error code: 400 - {'error': {'message': "'messages' must contain the word 'json' in some form, to use 'response_format' of type 'json_object'.", 'type': 'invalid_request_error', 'param': 'messages', 'code': None}}
+INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:16:00] "POST /api/chat HTTP/1.1" 500 -
 
-# load_dotenv()
-
-# client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-
-# # Initialize agents
-# geo_explorer = GeoExplorerAgent()
-# visual_guide = VisualGuideAgent()
-# climate_impact = ClimateImpactAgent()
-# travel_planner = TravelPlannerAgent()
-# disaster_risk = DisasterRiskAgent()
-# deep_sea = DeepSeaAgent()
-# historical_time = HistoricalTimeMachineAgent()
-# eco_footprint = EcoFootprintAgent()
-# culture_language = CultureLanguageAgent()
-# trend_analyzer = TrendAnalyzerAgent()
-
-# def generate_llm_response(message, model, coordinates):
-#     try:
-#         if not os.getenv('OPENAI_API_KEY'):
-#             raise ValueError("OpenAI API key is not set in environment variables")
-
-#         coords = coordinates.get('coordinates', 'unknown') if coordinates else 'unknown'
-#         zoom = coordinates.get('zoom', 'unknown') if coordinates else 'unknown'
-#         selected_area = coordinates.get('selectedArea', None)
-
-#         # Define functions for OpenAI to call
-#         functions = [
-#             {
-#                 "name": "get_location_info",
-#                 "description": "Fetch real-time and historical info about a location",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "location": {"type": "string"},
-#                         "coordinates": {"type": "array", "items": {"type": "number"}}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             },
-#             {
-#                 "name": "get_visual_data",
-#                 "description": "Fetch visual data (images, satellite views) for a location",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "coordinates": {"type": "array", "items": {"type": "number"}}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             },
-#             # Add similar function definitions for other agents...
-#             {
-#                 "name": "analyze_climate_impact",
-#                 "description": "Analyze climate changes for a location",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "coordinates": {"type": "array", "items": {"type": "number"}}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             },
-#             {
-#                 "name": "plan_travel",
-#                 "description": "Suggest travel plans and attractions for a location",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "coordinates": {"type": "array", "items": {"type": "number"}},
-#                         "query": {"type": "string"}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             },
-#             {
-#                 "name": "assess_disaster_risk",
-#                 "description": "Assess natural disaster risks for a location",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "coordinates": {"type": "array", "items": {"type": "number"}}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             },
-#             {
-#                 "name": "analyze_deep_sea",
-#                 "description": "Provide marine intelligence for ocean areas",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "coordinates": {"type": "array", "items": {"type": "number"}}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             },
-#             {
-#                 "name": "get_historical_data",
-#                 "description": "Fetch historical maps and data for a location",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "coordinates": {"type": "array", "items": {"type": "number"}}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             },
-#             {
-#                 "name": "analyze_eco_footprint",
-#                 "description": "Analyze carbon footprint and environmental impact",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "coordinates": {"type": "array", "items": {"type": "number"}}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             },
-#             {
-#                 "name": "get_cultural_insights",
-#                 "description": "Provide local culture and language insights",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "coordinates": {"type": "array", "items": {"type": "number"}}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             },
-#             {
-#                 "name": "predict_trends",
-#                 "description": "Predict geospatial trends like urban expansion",
-#                 "parameters": {
-#                     "type": "object",
-#                     "properties": {
-#                         "coordinates": {"type": "array", "items": {"type": "number"}}
-#                     },
-#                     "required": ["coordinates"]
-#                 }
-#             }
-#         ]
-
-#         # Call OpenAI with function calling
-#         response = client.chat.completions.create(
-#             model=model if model in ['gpt-4', 'gpt-3.5-turbo'] else 'gpt-3.5-turbo',
-#             messages=[
-#                 {"role": "system", "content": "You are a geospatial AI assistant that uses function calls to fetch detailed information."},
-#                 {"role": "user", "content": message}
-#             ],
-#             functions=functions,
-#             function_call="auto"
-#         )
-
-#         # Handle function call
-#         response_message = response.choices[0].message
-#         if response_message.function_call:
-#             function_name = response_message.function_call.name
-#             function_args = eval(response_message.function_call.arguments)  # Parse JSON (replace with json.loads for safety)
-
-#             if function_name == "get_location_info":
-#                 return geo_explorer.get_location_info(None, function_args.get('coordinates'))
-#             elif function_name == "get_visual_data":
-#                 return visual_guide.get_visual_data(function_args['coordinates'])
-#             elif function_name == "analyze_climate_impact":
-#                 return climate_impact.analyze_climate_impact(function_args['coordinates'])
-#             elif function_name == "plan_travel":
-#                 return travel_planner.plan_travel(function_args['coordinates'], function_args.get('query'))
-#             elif function_name == "assess_disaster_risk":
-#                 return disaster_risk.assess_disaster_risk(function_args['coordinates'])
-#             elif function_name == "analyze_deep_sea":
-#                 return deep_sea.analyze_deep_sea(function_args['coordinates'])
-#             elif function_name == "get_historical_data":
-#                 return historical_time.get_historical_data(function_args['coordinates'])
-#             elif function_name == "analyze_eco_footprint":
-#                 return eco_footprint.analyze_eco_footprint(function_args['coordinates'])
-#             elif function_name == "get_cultural_insights":
-#                 return culture_language.get_cultural_insights(function_args['coordinates'])
-#             elif function_name == "predict_trends":
-#                 return trend_analyzer.predict_trends(function_args['coordinates'])
-#             else:
-#                 return {"text": "Unknown function call", "metadata": {"error": "Invalid function"}}
-
-#         return {
-#             "text": response_message.content or "No response generated.",
-#             "metadata": {"coordinates": coords, "type": "default"}
-#         }
-#     except Exception as e:
-#         logger.error(f"LLM request failed: {str(e)}")
-#         raise Exception(f"LLM request failed: {str(e)}")
+"""

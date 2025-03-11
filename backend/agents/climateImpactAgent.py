@@ -1,36 +1,103 @@
 import requests
-import os
-from dotenv import load_dotenv
+from pydantic import BaseModel
+from typing import List, Dict, Any
+import logging
 
-load_dotenv()
+logger = logging.getLogger(__name__)
+
+# Define the response structure using Pydantic
+class AgentResponse(BaseModel):
+    text: str
+    suggestions: List[Dict[str, str]]
+    metadata: Dict[str, Any]
 
 class ClimateImpactAgent:
+    """Agent to fetch climate and weather information using Open-Meteo API."""
+    
     def __init__(self):
-        self.noaa_api_key = os.getenv('NOAA_API_KEY')
-        self.nasa_api_key = os.getenv('NASA_API_KEY')
-
-    def analyze_climate_impact(self, coordinates):
+        """Initialize the agent."""
+        pass
+    
+    def get_weather_info(self, location: str = None, coordinates: tuple[float, float] = None) -> dict:
+        """
+        Fetch weather information using either a location name or coordinates.
+        
+        Args:
+            location (str, optional): Name of the location (e.g., "Paris").
+            coordinates (tuple[float, float], optional): Latitude and longitude (e.g., (48.8566, 2.3522)).
+        
+        Returns:
+            dict: Response containing text, suggestions, and metadata.
+                  - text: Weather summary or error message.
+                  - suggestions: List of actionable links (e.g., weather forecast URL).
+                  - metadata: Additional info like coordinates or error details.
+        
+        Raises:
+            ValueError: If neither location nor coordinates are provided.
+        """
         try:
-            lat, lon = coordinates
-
-            # NOAA Climate Data (simplified)
-            noaa_url = f"https://www.ncdc.noaa.gov/cdo-web/api/v2/data?datasetid=GHCND&stationid=GHCND:USW00014734&startdate=2020-01-01&enddate=2025-01-01&limit=1000"
-            noaa_response = requests.get(noaa_url, headers={'token': self.noaa_api_key})
-            climate_data = noaa_response.json() if noaa_response.status_code == 200 else {}
-
-            # NASA Climate Data
-            nasa_url = f"https://power.larc.nasa.gov/api/temporal/climatology/point?parameters=T2M&community=RE&longitude={lon}&latitude={lat}&start=2020&end=2025&format=JSON"
-            nasa_response = requests.get(nasa_url)
-            nasa_data = nasa_response.json() if nasa_response.status_code == 200 else {}
-
-            response = {
-                "text": f"Climate impact analysis for {lat},{lon}:\nTemperature trends indicate {nasa_data.get('properties', {}).get('T2M', 'N/A')} over recent years, with NOAA data showing {climate_data.get('results', 'N/A')}.",
-                "metadata": {
-                    "coordinates": [lat, lon],
-                    "type": "climate_impact"
-                }
-            }
-            return response
+            # Determine coordinates
+            if coordinates is not None:
+                lat, lon = coordinates
+            elif location is not None:
+                from utils.geoUtils import geocode_location
+                result = geocode_location(location)
+                lat, lon = result['lat'], result['lon']
+            else:
+                raise ValueError("Either location or coordinates must be provided")
+            
+            # Fetch weather data from Open-Meteo API
+            url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract current weather
+            current = data['current_weather']
+            temperature = current['temperature']
+            windspeed = current['windspeed']
+            weather_code = current['weathercode']
+            
+            # Simple weather description based on code
+            weather_desc = {
+                0: "Clear sky",
+                1: "Mainly clear",
+                2: "Partly cloudy",
+                3: "Overcast",
+                45: "Fog",
+                48: "Depositing rime fog",
+                51: "Light drizzle",
+                53: "Moderate drizzle",
+                55: "Dense drizzle",
+                61: "Slight rain",
+                63: "Moderate rain",
+                65: "Heavy rain",
+                71: "Slight snow fall",
+                73: "Moderate snow fall",
+                75: "Heavy snow fall",
+                77: "Snow grains",
+                80: "Slight rain showers",
+                81: "Moderate rain showers",
+                82: "Violent rain showers",
+                85: "Slight snow showers",
+                86: "Heavy snow showers",
+                95: "Thunderstorm",
+                96: "Thunderstorm with slight hail",
+                99: "Thunderstorm with heavy hail"
+            }.get(weather_code, "Unknown weather condition")
+            
+            # Construct response
+            text = f"Current weather: {weather_desc}, Temperature: {temperature}°C, Wind Speed: {windspeed} km/h"
+            suggestions = [{"label": "View full forecast", "action": f"https://open-meteo.com/en/forecast?lat={lat}&lon={lon}"}]
+            metadata = {"coordinates": [lat, lon], "type": "weather_info"}
+            
+            return AgentResponse(text=text, suggestions=suggestions, metadata=metadata).model_dump()
+        
         except Exception as e:
-            print(f"ClimateImpactAgent error: {str(e)}")
-            return {"text": f"Error fetching climate data: {str(e)}", "metadata": {"error": str(e)}}
+            logger.error(f"Error in get_weather_info: {str(e)}")
+            response = AgentResponse(
+                text=f"Error fetching weather data: {str(e)}",
+                suggestions=[],
+                metadata={"error": str(e)}
+            )
+            return response.model_dump()
