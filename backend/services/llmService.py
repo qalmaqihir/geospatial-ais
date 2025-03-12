@@ -1,11 +1,10 @@
 import os
 import json
+import re
 import logging
 from dotenv import load_dotenv
 from openai import OpenAI
-import anthropic
-import google.generativeai as genai
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,44 +13,106 @@ load_dotenv()
 # Agents 
 from agents.geoExplorerAgent import GeoExplorerAgent
 from agents.climateImpactAgent import ClimateImpactAgent
+from agents.infoAgent import InfoAgent
+from utils.geoUtils import geocode_location, reverse_geocode
 
 # Instantiate the agents
 geo_explorer = GeoExplorerAgent()
 climate_impact = ClimateImpactAgent()
+info_agent = InfoAgent()
 
-# Define tools for dynamic invocation
-TOOL_CONFIG = {
-    "geo_explorer": {
-        "description": "Provides geographical information about a location.",
-        "function": geo_explorer.get_location_info,
-        "parameters": ["location", "coordinates"]
+# Define tools for OpenAI tool calling format with strict mode.
+# Note: reverse_geocode is used internally and not exposed as a tool.
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "geo_explorer",
+            "description": "Provides detailed geographical information about a location including coordinates, administrative regions, population, and landmarks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "nullable": True,
+                        "description": "The name of the location (e.g., 'Paris, France')."
+                    },
+                    "coordinates": {
+                        "type": "string",
+                        "nullable": True,
+                        "description": "Coordinates in 'latitude,longitude' format (e.g., '48.8566,2.3522')."
+                    }
+                },
+                "required": ["location", "coordinates"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
     },
-    "climate_impact": {
-        "description": "Provides climate and weather information for a location.",
-        "function": climate_impact.get_weather_info,
-        "parameters": ["location", "coordinates"]
+    {
+        "type": "function",
+        "function": {
+            "name": "climate_impact",
+            "description": "Provides detailed climate and weather information for a location including current conditions, forecasts, and historical climate data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "nullable": True,
+                        "description": "The name of the location (e.g., 'New York, USA')."
+                    },
+                    "coordinates": {
+                        "type": "string",
+                        "nullable": True,
+                        "description": "Coordinates in 'latitude,longitude' format (e.g., '40.7128,-74.0060')."
+                    }
+                },
+                "required": ["location", "coordinates"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "info_agent",
+            "description": "Provides detailed regional information (history, culture, and cuisine) for a location.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "nullable": True,
+                        "description": "The name of the region (e.g., 'Rawalpindi')."
+                    },
+                    "coordinates": {
+                        "type": "string",
+                        "nullable": True,
+                        "description": "Coordinates in 'latitude,longitude' format."
+                    }
+                },
+                "required": ["location", "coordinates"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
     }
+]
+
+# Function mapping for execution.
+TOOL_FUNCTIONS = {
+    "geo_explorer": geo_explorer.get_location_info,
+    "climate_impact": climate_impact.get_weather_info,
+    "info_agent": info_agent.get_info
 }
 
-
-def get_llm_client(model: str) -> tuple:
-    """Initialize and validate LLM clients with proper error handling."""
+def get_openai_client() -> OpenAI:
+    """Initialize and validate OpenAI client with proper error handling."""
     try:
-        if model == "gpt-4":
-            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-            return client, "openai"
-        elif model == "claude":
-            return anthropic.Anthropic(api_key=os.getenv('CLAUDE_API_KEY')), "claude"
-        elif model == "gemini":
-            genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-            return genai.GenerativeModel('gemini-pro'), "gemini"
-        elif model == "deepseek":
-            client = OpenAI(
-                api_key=os.getenv('DEEPSEEK_API_KEY'),
-                base_url="https://api.deepseek.com/v1"
-            )
-            return client, "deepseek"
-        raise ValueError(f"Unsupported model: {model}")
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        return client
     except KeyError as e:
         logger.error(f"Missing API key: {str(e)}")
         raise
@@ -59,237 +120,167 @@ def get_llm_client(model: str) -> tuple:
         logger.error(f"Client initialization failed: {str(e)}")
         raise
 
-def _format_llm_prompt(message: str, coordinates: Dict[str, Any], tools: dict) -> str:
-    """Construct a structured prompt with strict JSON formatting requirements."""
-    coord_text = f"at coordinates {coordinates['coordinates']} (zoom {coordinates['zoom']})" if coordinates else ""
-    tool_descriptions = "\n".join(
-        f"- {name}: {info['description']} (params: {info['parameters']})"
-        for name, info in tools.items()
-    )
-    
-    return f"""You are a geospatial AI assistant. The user is {coord_text} and asks: "{message}"
-
-                Available Tools:
-                {tool_descriptions}
-
-                Response Requirements:
-                1. If using a tool, output ONLY valid JSON with "tool" and "parameters"
-                2. For direct answers, use JSON with "text" (natural language) and "suggestions"
-                3. Maintain conversation flow and context
-
-                Examples:
-                Tool Call:
-                {{
-                "tool": "geo_explorer",
-                "parameters": {{
-                    "location": "Paris, France"
-                }}
-                }}
-
-                Direct Response:
-                {{
-                "text": "Here's information about your location...",
-                "suggestions": [
-                    {{"label": "View Map", "action": "map:paris"}}
-                ]
-                }}"""
-
-def _handle_tool_call(tool_name: str, parameters: dict) -> Dict[str, Any]:
-    """Execute tool calls with proper validation and error handling."""
-    try:
-        if tool_name not in TOOL_CONFIG:
-            return {"error": "Unknown tool", "details": tool_name}
+def execute_tool_calls(tool_calls: List[Dict], messages: List[Dict], default_location: Optional[str] = None) -> List[Dict]:
+    """
+    Execute tool calls and append the results to the conversation history.
+    If a tool call for geo_explorer, climate_impact, or info_agent is missing the "location" parameter,
+    it is filled in with default_location.
+    """
+    if not tool_calls:
+        return messages
         
-        # Validate parameters
-        required_params = TOOL_CONFIG[tool_name]["parameters"]
-        missing = [p for p in required_params if p not in parameters]
-        if missing:
-            return {"error": "Missing parameters", "missing": missing}
-        
-        # Execute tool
-        result = TOOL_CONFIG[tool_name]["function"](**parameters)
-        
-        # Convert tool-specific response to standard format
-        return {
-            "tool_response": result,
-            "metadata": {
-                "tool": tool_name,
-                "success": "error" not in result
-            }
-        }
-    except Exception as e:
-        logger.error(f"Tool execution failed: {str(e)}")
-        return {"error": "Tool execution failed", "details": str(e)}
-
-def _generate_conversational_response(client, provider: str, model: str, user_query: str, tool_data: dict) -> Dict[str, Any]:
-    """Convert raw tool data into a natural language response."""
-    try:
-        prompt = f"""Convert this technical data into a friendly, conversational response:
-        
-        User Query: {user_query}
-        Tool Data: {json.dumps(tool_data, indent=2)}
-        
-        Guidelines:
-        - Use simple, non-technical language
-        - Highlight key information first
-        - Include suggestions from the tool data
-        - Acknowledge any data limitations
-        - Keep responses under 3 paragraphs
-        """
-        
-        if provider=="openai":
-            response = client.chat.completions.create(
-                model='gpt-4o-mini',
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that explains information clearly."},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.6
-            )
-            content = response.choices[0].message.content
-        elif provider=="deepseek":
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that explains information clearly."},
-                    {"role": "user", "content": prompt}
-                ],
-                stream=False
-            )
-            content = response.choices[0].message.content
-        elif provider == "claude":
-            response = client.messages.create(
-                model='claude-3-opus-latest',
-                max_tokens=400,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            content = response.content[0].text
-        elif provider == "gemini-1.5-flash":
-            response = client.generate_content(prompt)
-            content = response.text
-        
-        return {
-            "text": content,
-            "suggestions": tool_data.get("suggestions", []),
-            "analysis": tool_data.get("analysis", {})
-        }
-    except Exception as e:
-        logger.error(f"Response generation failed: {str(e)}")
-        return {"text": "I encountered an error processing that request. Please try again.", "error": str(e)}
-
-def generate_llm_response(message: str, model: str, coordinates: Dict[str, Any]) -> Dict[str, Any]:
-    """End-to-end processing with improved error handling and conversational flow."""
-    try:
-        client, provider = get_llm_client(model)
-        prompt = _format_llm_prompt(message, coordinates, TOOL_CONFIG)
-        
-        # Get initial LLM response
-        if provider=="openai":
-            response = client.chat.completions.create(
-                model='gpt-3.5-turbo',
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that explains information clearly."},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.6
-            )
-            llm_output = response.choices[0].message.content
-        elif provider=="deepseek":
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that explains information clearly."},
-                    {"role": "user", "content": prompt}
-                ],
-                stream=False
-            )
-            llm_output = response.choices[0].message.content
-        elif provider == "claude":
-            response = client.messages.create(
-                model="claude-3-opus-20240229",
-                max_tokens=400,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            llm_output = response.content[0].text
-        elif provider == "gemini":
-            response = client.generate_content(prompt)
-            llm_output = response.text
-        
-        # Parse and validate response
+    for tool_call in tool_calls:
         try:
-            llm_response = json.loads(llm_output)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse LLM response as JSON, using fallback")
-            return {
-                "text": f"I'm having trouble processing that request. Here's what I can share: {llm_output}",
-                "error": "Invalid JSON response"
-            }
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
+            
+            if function_name in ["geo_explorer", "climate_impact", "info_agent"]:
+                if "location" not in function_args or not function_args["location"]:
+                    function_args["location"] = default_location if default_location is not None else ""
+            
+            if function_name not in TOOL_FUNCTIONS:
+                tool_result = json.dumps({"error": f"Unknown function: {function_name}"})
+            else:
+                result = TOOL_FUNCTIONS[function_name](**function_args)
+                tool_result = json.dumps(result)
+                
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_result
+            })
+            
+        except Exception as e:
+            logger.error(f"Error executing function {function_name}: {str(e)}")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": json.dumps({"error": str(e)})
+            })
+            
+    return messages
 
-        # Process tool calls
-        if "tool" in llm_response:
-            tool_result = _handle_tool_call(llm_response["tool"], llm_response.get("parameters", {}))
+def refine_response(client: OpenAI, technical_response: str) -> str:
+    """
+    Convert a technical response into a friendly, conversational answer with suggestions and links.
+    """
+    refine_prompt = f"""Please convert the following technical response into a friendly, concise, and conversational answer.
+Include helpful suggestions and relevant links for further exploration, but avoid unnecessary technical details.
+
+Response:
+{technical_response}"""
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a friendly assistant that reformats technical content into engaging, easy-to-understand language with suggestions and links."},
+            {"role": "user", "content": refine_prompt}
+        ],
+        temperature=0.7
+    )
+    refined = response.choices[0].message.content
+    return refined
+
+def generate_llm_response(message: str, coordinates: Optional[Dict[str, Any]] = None, model: str = "gpt-4o") -> Dict[str, Any]:
+    """
+    End-to-end processing with tool calling. Resolves the location name using coordinates,
+    injects it into the system prompt, processes tool calls, and finally refines the output
+    into a friendly and informative response.
+    
+    Args:
+        message: User's query text.
+        coordinates: Optional location details, e.g., {"coordinates": {"coordinates": [lat,lon], "zoom": zoom_level}}.
+        model: OpenAI model to use.
+    
+    Returns:
+        A dict containing the final refined response text and additional metadata.
+    """
+    try:
+        client = get_openai_client()
+        
+        # Resolve the location name from the coordinates.
+        location_name = "Unknown location"
+        if coordinates and "coordinates" in coordinates:
+            coord_value = coordinates['coordinates']['coordinates']
+            if isinstance(coord_value, list):
+                coord_str = ",".join(map(str, coord_value))
+            else:
+                coord_str = str(coord_value)
+            try:
+                lat_str, lon_str = coord_str.split(",")
+                lat, lon = float(lat_str.strip()), float(lon_str.strip())
+                location_name = reverse_geocode(lat, lon)
+                logger.info(f"Reverse geocoded location: {location_name}")
+            except Exception as e:
+                logger.warning(f"Failed to reverse geocode coordinates: {e}")
+        
+        # Create system message with instructions.
+        coord_text = f"at coordinates {coordinates['coordinates']['coordinates']} (zoom {coordinates['zoom']})" if coordinates else ""
+        system_message = f"""You are a geospatial AI assistant specialized in providing friendly, concise, and useful location-based information.
+The user is located in '{location_name}' {coord_text}.
+
+When responding, please:
+- Provide clear, succinct answers.
+- Include helpful suggestions and links where relevant.
+- Focus on delivering the most important information first.
+- Use a friendly and conversational tone.
+
+Use the geo_explorer tool for geographical details, the climate_impact tool for weather data, and the info_agent tool for regional history, culture, and cuisine.
+If you can answer directly, avoid unnecessary technical details."""
+        
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": message}
+        ]
+        
+        # First API call: Get the initial response with potential tool calls.
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.7
+        )
+        
+        response_message = response.choices[0].message
+        
+        # Append the assistant's response, preserving any tool_calls.
+        if hasattr(response_message, "tool_calls") and response_message.tool_calls:
+            messages.append({
+                "role": response_message.role,
+                "content": response_message.content or "",
+                "tool_calls": response_message.tool_calls
+            })
+        else:
+            messages.append({"role": response_message.role, "content": response_message.content or ""})
+        
+        # If tool calls are present, execute them.
+        if hasattr(response_message, "tool_calls") and response_message.tool_calls:
+            messages = execute_tool_calls(response_message.tool_calls, messages, default_location=location_name)
             
-            if "error" in tool_result:
-                return _generate_conversational_response(
-                    client, provider, model, message,
-                    {"error": tool_result["error"], "original_query": message}
-                )
-            
-            return _generate_conversational_response(
-                client, provider, model, message,
-                tool_result.get("tool_response", {})
+            # Make a second API call with the updated conversation history.
+            final_response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7
             )
-
-        # Direct response cleanup
+            
+            final_message = final_response.choices[0].message
+        else:
+            final_message = response_message
+        
+        # Refine the final technical response into a friendly, informative answer.
+        refined_text = refine_response(client, final_message.content)
+        
         return {
-            "text": llm_response.get("text", "I couldn't process that request."),
-            "suggestions": llm_response.get("suggestions", []),
+            "text": refined_text,
+            "tool_usage": [t.function.name for t in response_message.tool_calls] if hasattr(response_message, "tool_calls") and response_message.tool_calls else [],
             "analysis": coordinates if coordinates else {}
         }
-
+    
     except Exception as e:
         logger.error(f"End-to-end processing failed: {str(e)}")
         return {
             "text": "I'm having trouble with that request. Please try rephrasing or ask about something else.",
             "error": str(e)
         }
-
-
-## TODO:
-"""
-
-Fix the initialization Error for the Gemini, Claude
-:00] "POST /api/chat HTTP/1.1" 500 -
-INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:16:09] "OPTIONS /api/chat HTTP/1.1" 200 -
-INFO:routes.chatRoutes:Chat request - Session: d10b5e85-2ad5-49bb-86ca-af9c0031c1b1, Model: gemmni
-ERROR:services.llmService:Client initialization failed: Unsupported model: gemmni
-ERROR:services.llmService:End-to-end processing failed: Unsupported model: gemmni
-ERROR:routes.chatRoutes:LLM Error: Unsupported model: gemmni
-INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:16:09] "POST /api/chat HTTP/1.1" 500 -
-INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:16:19] "OPTIONS /api/chat HTTP/1.1" 200 -
-INFO:routes.chatRoutes:Chat request - Session: d10b5e85-2ad5-49bb-86ca-af9c0031c1b1, Model: claude-2
-ERROR:services.llmService:Client initialization failed: Unsupported model: claude-2
-ERROR:services.llmService:End-to-end processing failed: Unsupported model: claude-2
-ERROR:routes.chatRoutes:LLM Error: Unsupported model: claude-2
-
-
-
-Check the Json Format error for G-P-T and DeepSeek
-INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:15:40] "OPTIONS /api/chat HTTP/1.1" 200 -
-INFO:routes.chatRoutes:Chat request - Session: d10b5e85-2ad5-49bb-86ca-af9c0031c1b1, Model: deepseek
-INFO:httpx:HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
-WARNING:services.llmService:Failed to parse LLM response as JSON, using fallback
-ERROR:routes.chatRoutes:LLM Error: Invalid JSON response
-INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:15:49] "POST /api/chat HTTP/1.1" 500 -
-
-INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:15:58] "OPTIONS /api/chat HTTP/1.1" 200 -
-INFO:routes.chatRoutes:Chat request - Session: d10b5e85-2ad5-49bb-86ca-af9c0031c1b1, Model: gpt-4
-INFO:httpx:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-INFO:httpx:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 400 Bad Request"
-ERROR:services.llmService:Response generation failed: Error code: 400 - {'error': {'message': "'messages' must contain the word 'json' in some form, to use 'response_format' of type 'json_object'.", 'type': 'invalid_request_error', 'param': 'messages', 'code': None}}
-ERROR:routes.chatRoutes:LLM Error: Error code: 400 - {'error': {'message': "'messages' must contain the word 'json' in some form, to use 'response_format' of type 'json_object'.", 'type': 'invalid_request_error', 'param': 'messages', 'code': None}}
-INFO:werkzeug:127.0.0.1 - - [11/Mar/2025 14:16:00] "POST /api/chat HTTP/1.1" 500 -
-
-"""

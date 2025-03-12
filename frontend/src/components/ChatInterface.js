@@ -30,8 +30,7 @@ const ChatInterface = ({ messages, setMessages, isLoading, selectedModel, setSel
           </Dropdown.Toggle>
           <Dropdown.Menu>
             <Dropdown.Item eventKey="gpt-4">GPT-4</Dropdown.Item>
-            <Dropdown.Item eventKey="gpt-3">GPT-3</Dropdown.Item>
-            <Dropdown.Item eventKey="claude-2">Claude 2</Dropdown.Item>
+            <Dropdown.Item eventKey="claude">Claude 2</Dropdown.Item>
             <Dropdown.Item eventKey="gemmni">Gemmni</Dropdown.Item>
             <Dropdown.Item eventKey="deepseek">Deepseek</Dropdown.Item>
             

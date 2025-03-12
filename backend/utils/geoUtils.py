@@ -1,4 +1,5 @@
 import requests
+import re
 def validate_coordinates(lat, lon):
     try:
         lat, lon = float(lat), float(lon)
@@ -66,7 +67,7 @@ def reverse_geocode(lat, lon):
     except requests.RequestException as e:
         raise Exception(f'Reverse geocoding service error: {str(e)}')
 
-# Example usage for testing
-if __name__ == "__main__":
-    print("Geocoding 'Paris':", geocode_location("Paris"))
-    print("Reverse geocoding (48.8566, 2.3522):", reverse_geocode(48.8566, 2.3522))
+# # Example usage for testing
+# if __name__ == "__main__":
+#     print("Geocoding 'Paris':", geocode_location("Paris"))
+#     print("Reverse geocoding (48.8566, 2.3522):", reverse_geocode(48.8566, 2.3522))
